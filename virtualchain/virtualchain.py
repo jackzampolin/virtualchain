@@ -35,11 +35,9 @@ import errno
 
 from ConfigParser import SafeConfigParser
 
-from .lib import config, workpool, indexer
-from .lib.blockchain import session
-from pybitcoin import BitcoindClient, ChainComClient
+from .lib import config, workpool, indexer, import_blockchain
 
-log = session.get_logger("virtualchain")
+log = config.get_logger("virtualchain")
 
 # global instance of our implementation's state engine
 state_engine = None
@@ -48,7 +46,7 @@ state_engine = None
 running = False
 
 
-def sync_virtualchain(bitcoind_opts, last_block, state_engine):
+def sync_virtualchain(blockchain_opts, last_block, state_engine):
     """
     Synchronize the virtual blockchain state up until a given block.
 
@@ -69,7 +67,7 @@ def sync_virtualchain(bitcoind_opts, last_block, state_engine):
         try:
 
             # advance state
-            indexer.StateEngine.build(bitcoind_opts, last_block+1, state_engine)
+            indexer.StateEngine.build(blockchain_opts, last_block+1, state_engine)
             break
 
         except Exception, e:
@@ -103,7 +101,6 @@ def stop_virtualchain():
 
 
 def run_virtualchain( state_engine ):
-
     """
     Continuously and periodically feed new blocks into the state engine.
     This method loops pretty much forever; consider calling
@@ -117,52 +114,51 @@ def run_virtualchain( state_engine ):
 
     global running
 
-    connect_bitcoind = session.get_connect_bitcoind()
     config_file = config.get_config_filename()
-    bitcoin_opts = config.get_bitcoind_config(config_file)
+    blockchain_opts = config.get_blockchain_config(config_file)
 
-    arg_bitcoin_opts, argparser = config.parse_bitcoind_args(return_parser=True)
+    arg_blockchain_opts, argparser = config.parse_blockchain_args(return_parser=True)
 
     # command-line overrides config file
-    for (k, v) in arg_bitcoin_opts.items():
-        bitcoin_opts[k] = v
+    for (k, v) in arg_blockchain_opts.items():
+        blockchain_opts[k] = v
 
-    log.debug("multiprocessing config = (%s, %s)" % (config.configure_multiprocessing(bitcoin_opts)))
+    log.debug("multiprocessing config = (%s, %s)" % (config.configure_multiprocessing(blockchain_opts)))
 
     try:
 
-        bitcoind = connect_bitcoind(bitcoin_opts)
+        blockchain_client = connect_blockchain(blockchain_opts)
 
     except Exception, e:
         log.exception(e)
         return 1
 
-    _, last_block_id = indexer.get_index_range(bitcoind)
+    _, last_block_id = indexer.get_index_range(blockchain_client)
 
     running = True
     while running:
 
         # keep refreshing the index
-        sync_virtualchain(bitcoin_opts, last_block_id, state_engine )
+        sync_virtualchain(blockchain_opts, last_block_id, state_engine )
 
         time.sleep(config.REINDEX_FREQUENCY)
 
-        _, last_block_id = indexer.get_index_range(bitcoind)
+        _, last_block_id = indexer.get_index_range(blockchain_client)
 
 
-def setup_virtualchain(impl=None, testset=False, bitcoind_connection_factory=None, index_worker_env=None):
+def setup_virtualchain(impl=None, testset=False, blockchain_connection_factory=None, index_worker_env=None):
     """
     Set up the virtual blockchain.
     Use the given virtual blockchain core logic.
     """
 
-    global connect_bitcoind
+    global connect_blockchain
 
     if impl is not None:
         config.set_implementation(impl, testset)
 
-    if bitcoind_connection_factory is not None:
-        workpool.set_connect_bitcoind( bitcoind_connection_factory )
+    if blockchain_connection_factory is not None:
+        workpool.set_connect_blockchain( blockchain_connection_factory )
 
     if index_worker_env is not None: 
         # expect a dict
@@ -193,16 +189,16 @@ def virtualchain_set_opfields( op, **fields ):
     return op
 
 
-def connect_bitcoind( opts ):
+def connect_blockchain( opts ):
     """
-    Top-level method to connect to bitcoind,
+    Top-level method to connect to the blockchain,
     using either a built-in default, or a module
     to be loaded at runtime whose path is referred
     to by the environment variable
     VIRTUALCHAIN_MOD_CONNECT_BLOCKCHAIN.
     """
-    connect_bitcoind_factory = workpool.multiprocess_connect_bitcoind()
-    return connect_bitcoind_factory( opts )
+    connect_blockchain_factory = workpool.multiprocess_connect_blockchain(opts)
+    return connect_blockchain_factory( opts )
 
 if __name__ == '__main__':
 
