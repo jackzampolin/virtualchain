@@ -40,6 +40,7 @@ setup(
     zip_safe=False,
     include_package_data=True,
     install_requires=[
+        'protocoin>=0.1',
         'bitcoin>=1.1.42',
         'python-bitcoinrpc==0.1',
         'utilitybelt>=0.2.6'
