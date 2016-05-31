@@ -960,3 +960,190 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
       
    return nulldata_txs
 
+
+def txid_to_block_data(txid, bitcoind_proxy, blockchain_headers_path):
+    """
+    Given a txid, get its block's data.
+
+    Use SPV to verify the information we receive from the (untrusted)
+    bitcoind host.
+
+    @bitcoind_proxy must be a BitcoindConnection
+
+    Return the (block hash, block data, txdata) on success
+    Return (None, None, None) on error
+    """
+
+    timeout = 1.0
+    while True:
+        try:
+            untrusted_tx_data = bitcoind_proxy.getrawtransaction(txid, 1)
+            untrusted_block_hash = untrusted_tx_data['blockhash']
+            untrusted_block_data = bitcoind_proxy.getblock(untrusted_block_hash)
+            break
+        except Exception, e:
+            log.exception(e)
+            log.error("Unable to obtain block data; retrying...")
+            time.sleep(timeout)
+            timeout = timeout * 2 + random.random() * timeout
+
+    # first, can we trust this block? is it in the SPV headers?
+    untrusted_block_header_hex = block_header_to_hex(untrusted_block_data, untrusted_block_data['previousblockhash'])
+    block_id = SPVClient.block_header_index(blockchain_headers_path, (untrusted_block_header_hex + "00").decode('hex'))
+    if block_id < 0:
+        # bad header
+        log.error("Block header '%s' is not in the SPV headers" % untrusted_block_header_hex)
+        return (None, None, None)
+
+    # block header is trusted.  Is the transaction data consistent with it?
+    if not block_verify(untrusted_block_data):
+        log.error("Block transaction IDs are not consistent with the trusted header's Merkle root")
+        return (None, None, None)
+
+    # verify block hash
+    if not block_header_verify(untrusted_block_data, untrusted_block_data['previousblockhash'], untrusted_block_hash):
+        log.error("Block hash is not consistent with block header")
+        return (None, None, None)
+
+    # we trust the block hash, block data, and txids
+    block_hash = untrusted_block_hash
+    block_data = untrusted_block_data
+    tx_data = untrusted_tx_data
+
+    return (block_hash, block_data, tx_data)
+
+
+
+def txid_to_serial_number(txid, bitcoind_proxy):
+    """
+    Given a transaction ID, convert it into a serial number
+    (defined as $block_id-$tx_index).
+
+    Use SPV to verify the information we receive from the (untrusted)
+    bitcoind host.
+
+    @bitcoind_proxy must be a BitcoindConnection
+
+    Return the serial number on success
+    Return None on error
+    """
+
+    block_hash, block_data, _ = txid_to_block_data(txid, bitcoind_proxy )
+    if block_hash is None or block_data is None:
+        return None
+
+    # What's the tx index?
+    try:
+        tx_index = block_data['tx'].index(txid)
+    except:
+        # not actually present
+        log.error("Transaction %s is not present in block %s (%s)" % (txid, block_id, block_hash))
+
+    return "%s-%s" % (block_id, tx_index)
+
+
+
+def serial_number_to_tx(serial_number, bitcoind_proxy, blockchain_headers_path ):
+    """
+    Convert a serial number into its transaction in the blockchain.
+    Use an untrusted bitcoind connection to get the list of transactions,
+    and use trusted SPV headers to ensure that the transaction obtained is on the main chain.
+    @bitcoind_proxy must be a BitcoindConnection 
+
+    Return the SPV-verified transaction object (as a dict) on success
+    Return None on error
+    """
+
+    parts = serial_number.split("-")
+    block_id = int(parts[0])
+    tx_index = int(parts[1])
+
+    timeout = 1.0
+    while True:
+        try:
+            block_hash = bitcoind_proxy.getblockhash(block_id)
+            block_data = bitcoind_proxy.getblock(block_hash)
+            break
+        except Exception, e:
+            log.error("Unable to obtain block data; retrying...")
+            time.sleep(timeout)
+            timeout = timeout * 2 + random.random() * timeout
+
+    rc = SPVClient.sync_header_chain(blockchain_headers_path, bitcoind_proxy.opts['bitcoind_server'], block_id)
+    if not rc:
+        log.error("Failed to synchronize SPV header chain up to %s" % block_id)
+        return None
+
+    # verify block header
+    rc = SPVClient.block_header_verify(blockchain_headers_path, block_id, block_hash, block_data)
+    if not rc:
+        log.error("Failed to verify block header for %s against SPV headers" % block_id)
+        return None
+
+    # verify block txs
+    rc = SPVClient.block_verify(block_data, block_data['tx'])
+    if not rc:
+        log.error("Failed to verify block transaction IDs for %s against SPV headers" % block_id)
+        return None
+
+    # sanity check
+    if tx_index >= len(block_data['tx']):
+        log.error("Serial number %s references non-existant transaction %s (out of %s txs)" % (serial_number, tx_index, len(block_data['tx'])))
+        return None
+
+    # obtain transaction
+    txid = block_data['tx'][tx_index]
+    tx = bitcoind_proxy.getrawtransaction(txid, 1)
+
+    # verify tx
+    rc = SPVClient.tx_verify(block_data['tx'], tx)
+    if not rc:
+        log.error("Failed to verify block transaction %s against SPV headers" % txid)
+        return None
+
+    # verify tx index
+    if tx_index != SPVClient.tx_index(block_data['tx'], tx):
+        log.error("TX index mismatch: serial number identifies transaction number %s (%s), but got transaction %s" % \
+                (tx_index, block_data['tx'][tx_index], block_data['tx'][ SPVClient.tx_index(block_data['tx'], tx) ]))
+        return None
+
+    # success!
+    return tx
+
+
+def parse_tx_op_return(tx):
+    """
+    Given a transaction, locate its OP_RETURN and parse
+    out its opcode and payload.
+    Return (opcode, payload) on success
+    Return (None, None) if there is no OP_RETURN, or if it's not a blockchain ID operation.
+    """
+
+    # find OP_RETURN output
+    op_return = None
+    outputs = tx['vout']
+    for out in outputs:
+        if int(out["scriptPubKey"]['hex'][0:2], 16) == pybitcoin.opcodes.OP_RETURN:
+            op_return = out['scriptPubKey']['hex'].decode('hex')
+            break
+
+    if op_return is None:
+        pp = pprint.PrettyPrinter()
+        pp.pprint(tx)
+        log.error("transaction has no OP_RETURN output")
+        return (None, None)
+
+    # [0] is OP_RETURN, [1] is the length; [2:4] are 'id', [4] is opcode
+    magic = op_return[2:4]
+
+    if magic != BLOCKCHAIN_ID_MAGIC:
+        # not a blockchain ID operation
+        log.error("OP_RETURN output does not encode a blockchain ID operation")
+        return (None, None)
+
+    opcode = op_return[4]
+    payload = op_return[5:]
+
+    return (opcode, payload)
+
+
