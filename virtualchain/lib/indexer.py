@@ -38,7 +38,6 @@ import threading
 import time
 import socket
 import binascii
-import pybitcoin
 import copy
 import shutil
 import time
@@ -50,12 +49,14 @@ from collections import defaultdict
 
 import config
 import workpool
-import blockchain.transactions as transactions
-import blockchain.session as session
+
+from hash import bin_hash160, bin_double_sha256 
+from config import get_logger, import_blockchain
+from merkle import MerkleTree
 
 from utilitybelt import is_hex
 
-log = session.get_logger("virtualchain")
+log = get_logger("virtualchain")
  
 RESERVED_KEYS = [
    'virtualchain_opcode',
@@ -642,7 +643,7 @@ class StateEngine( object ):
         """
         Given the Merkle root of the set of records processed, calculate the consensus hash.
         """
-        return binascii.hexlify( pybitcoin.hash.bin_hash160(merkle_root, True)[0:16])
+        return binascii.hexlify( bin_hash160(merkle_root, True)[0:16])
 
   
     @classmethod 
@@ -652,15 +653,15 @@ class StateEngine( object ):
         """
         record_hashes = []
         for serialized_op in serialized_ops:
-            record_hash = binascii.hexlify( pybitcoin.hash.bin_double_sha256( serialized_op ) )
+            record_hash = binascii.hexlify( bin_double_sha256( serialized_op ) )
             record_hashes.append( record_hash )
 
         if len(record_hashes) == 0:
-            record_hashes.append( binascii.hexlify( pybitcoin.hash.bin_double_sha256( "" ) ) )
+            record_hashes.append( binascii.hexlify( bin_double_sha256( "" ) ) )
 
         # put records into their own Merkle tree, and mix the root with the consensus hashes.
         record_hashes.sort()
-        record_merkle_tree = pybitcoin.MerkleTree( record_hashes )
+        record_merkle_tree = MerkleTree( record_hashes )
         record_root_hash = record_merkle_tree.root()
 
         return record_root_hash
@@ -676,7 +677,7 @@ class StateEngine( object ):
         # mix into previous consensus hashes...
         all_hashes = prev_consensus_hashes[:] + [record_root_hash]
         all_hashes.sort()
-        all_hashes_merkle_tree = pybitcoin.MerkleTree( all_hashes )
+        all_hashes_merkle_tree = MerkleTree( all_hashes )
         root_hash = all_hashes_merkle_tree.root()
 
         consensus_hash = StateEngine.calculate_consensus_hash( root_hash )
@@ -1073,7 +1074,7 @@ class StateEngine( object ):
         s.free_indexer_memory()
 
 
-    def start_workpool( self, bitcoind_opts ):
+    def start_workpool( self, blockchain_opts ):
         """
         Make a work pool for ourselves.
         Raise an exception if one already exists.
@@ -1082,7 +1083,7 @@ class StateEngine( object ):
         if self.pool is not None:
             raise Exception("Already indexing")
 
-        self.pool = workpool.multiprocess_pool( bitcoind_opts, os.path.abspath( __file__ ) )
+        self.pool = workpool.multiprocess_pool( blockchain_opts, os.path.abspath( __file__ ) )
         return True
 
 
@@ -1118,7 +1119,7 @@ class StateEngine( object ):
 
 
     @classmethod
-    def build( cls, bitcoind_opts, end_block_id, state_engine ):
+    def build( cls, blockchain_opts, end_block_id, state_engine ):
         """
         Top-level call to process all blocks in the blockchain.
         Goes and fetches all OP_RETURN nulldata in order,
@@ -1144,11 +1145,23 @@ class StateEngine( object ):
             log.debug("Up-to-date (%s >= %s)" % (first_block_id, end_block_id))
             return True 
 
-        num_workers, worker_batch_size = config.configure_multiprocessing( bitcoind_opts )
-
         rc = True
 
-        state_engine.start_workpool( bitcoind_opts )
+        try:
+            assert 'blockchain' in blockchain_opts, "Missing 'blockchain' in %s" % blockchain_opts
+        except Exception, e:
+            log.exception(e)
+            sys.exit(1)
+
+        try:
+            blockchain_mod = import_blockchain( blockchain_opts['blockchain'] )
+        except Exception, e:
+            log.exception(e)
+            log.error("FATAL: failed to import blockchain '%s' (path = %s)" % (blockchain_opts['blockchain'], sys.path))
+            sys.exit(1)
+
+        num_workers, worker_batch_size = config.configure_multiprocessing( blockchain_opts )
+        state_engine.start_workpool( blockchain_opts )
         
         try:
             
@@ -1168,7 +1181,7 @@ class StateEngine( object ):
                 block_ids = range( block_id, min(block_id + worker_batch_size * num_workers, end_block_id) )
                
                 # returns: [(block_id, txs)]
-                block_ids_and_txs = transactions.get_nulldata_txs_in_blocks( state_engine.get_workpool(), bitcoind_opts, block_ids )
+                block_ids_and_txs = blockchain_mod.get_virtualchain_transactions( state_engine.get_workpool(), blockchain_opts, block_ids )
                 
                 # process in order by block ID
                 block_ids_and_txs.sort()
@@ -1302,17 +1315,17 @@ class StateEngine( object ):
         return self.rejected
 
 
-def get_index_range( bitcoind ):
+def get_index_range( blockchain_client ):
     """
     Get the range of block numbers that we need to fetch from the blockchain.
     
-    Return None if we fail to connect to bitcoind.
+    Return None if we fail to connect to the blockchain.
     """
 
     start_block = config.get_first_block_id()
        
     try:
-       current_block = int(bitcoind.getblockcount())
+       current_block = int(get_blockchain_height(blockchain_client))
         
     except Exception, e:
        log.error(e)
@@ -1347,7 +1360,7 @@ def get_index_range( bitcoind ):
     return start_block, current_block
 
 
-def indexer_main_loop_body( key, payload ):
+def indexer_main_loop_body( blockchain_mod, key, payload ):
     """
     Worker main loop: parse a blockchain RPC
     call and dispatch it.
@@ -1358,7 +1371,15 @@ def indexer_main_loop_body( key, payload ):
        log.error("No method given")
        return {"error": "No method given"}
 
-    result = transactions.indexer_rpc_dispatch( method_name, method_args )
+    method = getattr(blockchain_mod, method_name, None )
+    if method is None:
+        raise Exception("Unknown method '%s'" % method_name)
+
+    try:
+        result = method( *method_args )
+    except Exception, e:
+        log.exception(e)
+        result = {"error": "%s(%s) raised exception" % (method_name, ",".join([str(m) for m in method_args]))}
 
     workpool.Workpool.worker_post_message( key, pickle.dumps( result ) )
 
@@ -1367,6 +1388,22 @@ def indexer_main_loop_body( key, payload ):
 # (this file serves as the program to run, if running as a worker)
 if __name__ == "__main__":
 
-    log.debug("Worker %s starting" % (os.getpid()))
-    workpool.multiprocess_worker_main( indexer_main_loop_body )
+    assert len(sys.argv) == 2, "Usage: %s BLOCKCHAIN_NAME (got %s)" % (sys.argv[0], sys.argv)
+    blockchain_name = sys.argv[1]
+
+    try:
+        blockchain_mod = import_blockchain( blockchain_name )
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to load blockchain module for '%s'" % blockchain_name)
+        sys.exit(1)
+
+    for (key, payload) in workpool.Workpool.worker_next_message():
+        try:
+            indexer_main_loop_body( blockchain_mod, key, payload )
+        except:
+            log.error("Worker %s existing on exception" % os.getpid())
+            log.error(traceback.format_exc())
+            sys.stderr.flush()
+            sys.exit(1)
 
