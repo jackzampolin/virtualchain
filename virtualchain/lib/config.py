@@ -24,6 +24,10 @@
 
 import os
 import argparse
+import logging
+import importlib
+import types
+import imp
 from ConfigParser import SafeConfigParser
 
 DEBUG = True
@@ -46,12 +50,57 @@ MINUTES_PER_HOUR = 60
 SECONDS_PER_MINUTE = 60
 MINUTES_PER_YEAR = DAYS_PER_YEAR*HOURS_PER_DAY*MINUTES_PER_HOUR
 SECONDS_PER_YEAR = int(round(MINUTES_PER_YEAR*SECONDS_PER_MINUTE))
-BLOCKS_PER_YEAR = int(round(MINUTES_PER_YEAR/AVERAGE_MINUTES_PER_BLOCK))
-EXPIRATION_PERIOD = BLOCKS_PER_YEAR*1
 AVERAGE_BLOCKS_PER_HOUR = MINUTES_PER_HOUR/AVERAGE_MINUTES_PER_BLOCK
 
 BLOCKS_CONSENSUS_HASH_IS_VALID = 4*AVERAGE_BLOCKS_PER_HOUR
 
+# attributes we'll need
+BLOCKCHAIN_MOD_PROTOTYPE = {
+    "get_blockchain_config": [types.FunctionType, callable],
+    "connect_blockchain": [types.FunctionType, callable],
+    "get_blockchain_height": [types.FunctionType, callable],
+    "get_virtualchain_transactions": [types.FunctionType, callable],
+    "AVERAGE_BLOCKS_PER_HOUR": [int,long,float]
+}
+
+BLOCKCHAIN_CONFIG_REQUIRED_VALUES = [
+    "blockchain",
+    "blockchain_server",
+    "blockchain_port"
+]
+
+
+def get_logger(name=None):
+    """
+    Get virtualchain's logger
+    """
+
+    level = logging.CRITICAL
+    if DEBUG:
+        logging.disable(logging.NOTSET)
+        level = logging.DEBUG
+
+    if name is None:
+        name = "<unknown>"
+        level = logging.CRITICAL
+
+    log = logging.getLogger(name=name)
+    log.setLevel( level )
+    console = logging.StreamHandler()
+    console.setLevel( level )
+    log_format = ('[%(levelname)s] [%(module)s:%(lineno)d] (' + str(os.getpid()) + ') %(message)s' if DEBUG else '%(message)s')
+    formatter = logging.Formatter( log_format )
+    console.setFormatter(formatter)
+    log.propagate = False
+
+    if len(log.handlers) > 0:
+        for i in xrange(0, len(log.handlers)):
+            log.handlers.pop(0)
+    
+    log.addHandler(console)
+    return log
+
+log = get_logger("virtualchain")
 
 def get_impl(impl):
     """
@@ -153,175 +202,31 @@ def get_snapshots_filename(impl=None):
     return os.path.join(working_dir, snapshots_filename)
 
 
-def configure_multiprocessing(bitcoind_opts, impl=None):
+def configure_multiprocessing(blockchain_opts, impl=None):
     """
-    Given the set of bitcoind options (i.e. the location of the bitcoind server),
+    Given the set of blockchain options (i.e. the location of the blockchain server),
     come up with some good multiprocessing parameters.
 
     Return (number of processes, number of blocks per process)
-    Return (None, None) if we could make no inferences from the bitcoind opts.
+    Return (None, None) if we could make no inferences from the blockchain opts.
     """
 
-    if bitcoind_opts is None:
+    if blockchain_opts is None:
         return (None, None)
 
-    if bitcoind_opts.has_key("multiprocessing_num_procs") and bitcoind_opts.has_key("multiprocessing_num_blocks"):
-        return bitcoind_opts["multiprocessing_num_procs"], bitcoind_opts["multiprocessing_num_blocks"]
+    if blockchain_opts.has_key("multiprocessing_num_procs") and blockchain_opts.has_key("multiprocessing_num_blocks"):
+        return blockchain_opts["multiprocessing_num_procs"], blockchain_opts["multiprocessing_num_blocks"]
 
-    if bitcoind_opts.get("bitcoind_server", None) is None:
+    if blockchain_opts.get("blockchain_server", None) is None:
         return (None, None)
 
-    if bitcoind_opts["bitcoind_server"] in ["localhost", "127.0.0.1", "::1"]:
+    if blockchain_opts["blockchain_server"] in ["localhost", "127.0.0.1", "::1"]:
         # running locally
         return (1, 10)
 
     else:
         # running remotely
         return (10, 1)
-
-
-def get_bitcoind_config(config_file=None, impl=None):
-    """
-    Set bitcoind options globally.
-    Call this before trying to talk to bitcoind.
-    """
-
-    loaded = False
-
-    bitcoind_server = None
-    bitcoind_port = None
-    bitcoind_user = None
-    bitcoind_passwd = None
-    bitcoind_use_https = None
-    bitcoind_timeout = None
-    bitcoind_mock = None
-    bitcoind_mock_save_file = None
-
-    if config_file is not None:
-
-        parser = SafeConfigParser()
-        parser.read(config_file)
-
-        if parser.has_section('bitcoind'):
-
-            if parser.has_option('bitcoind', 'server'):
-                bitcoind_server = parser.get('bitcoind', 'server')
-
-            if parser.has_option('bitcoind', 'port'):
-                bitcoind_port = int(parser.get('bitcoind', 'port'))
-
-            if parser.has_option('bitcoind', 'user'):
-                bitcoind_user = parser.get('bitcoind', 'user')
-
-            if parser.has_option('bitcoind', 'passwd'):
-                bitcoind_passwd = parser.get('bitcoind', 'passwd')
-
-            if parser.has_option('bitcoind', 'use_https'):
-                use_https = parser.get('bitcoind', 'use_https')
-            else:
-                use_https = 'no'
-
-            if parser.has_option("bitcoind", "save_file"):
-                bitcoind_mock_save_file = parser.get("bitcoind", "save_file")
-
-            if parser.has_option('bitcoind', 'mock'):
-                mock = parser.get('bitcoind', 'mock')
-            else:
-                mock = 'no'
-
-            if parser.has_option('bitcoind', 'timeout'):
-                bitcoind_timeout = float(parser.get('bitcoind', 'timeout'))
-
-            if use_https.lower() in ["yes", "y", "true", "1", "on"]:
-                bitcoind_use_https = True
-            else:
-                bitcoind_use_https = False
-
-            if mock.lower() in ["yes", "y", "true", "1", "on"]:
-                bitcoind_mock = True
-            else:
-                bitcoind_mock = False
-            
-            loaded = True
-
-    if not loaded:
-
-        bitcoind_server = 'bitcoin.blockstack.com'
-        bitcoind_port = '8332'
-        bitcoind_user = 'blockstack'
-        bitcoind_passwd = 'blockstacksystem'
-        bitcoind_use_https = False
-        bitcoind_mock = False
-        bitcoind_timeout = 300
-        bitcoind_mock_save_file = None
-
-    default_bitcoin_opts = {
-        "bitcoind_user": bitcoind_user,
-        "bitcoind_passwd": bitcoind_passwd,
-        "bitcoind_server": bitcoind_server,
-        "bitcoind_port": bitcoind_port,
-        "bitcoind_use_https": bitcoind_use_https,
-        "bitcoind_timeout": bitcoind_timeout,
-        "bitcoind_mock": bitcoind_mock,
-        "bitcoind_mock_save_file": bitcoind_mock_save_file
-    }
-
-    return default_bitcoin_opts
-
-
-def parse_bitcoind_args(return_parser=False, parser=None, impl=None):
-    """
-     Get bitcoind command-line arguments.
-     Optionally return the parser used to do so as well.
-    """
-
-    impl = get_impl(impl)
-
-    opts = {}
-
-    if parser is None:
-        parser = argparse.ArgumentParser(description='%s version %s' % (impl.get_virtual_chain_name(testset=TESTSET), impl.get_virtual_chain_version()))
-
-    parser.add_argument(
-          '--bitcoind-server',
-          help='the hostname or IP address of the bitcoind RPC server')
-    parser.add_argument(
-          '--bitcoind-port', type=int,
-          help='the bitcoind RPC port to connect to')
-    parser.add_argument(
-          '--bitcoind-user',
-          help='the username for bitcoind RPC server')
-    parser.add_argument(
-          '--bitcoind-passwd',
-          help='the password for bitcoind RPC server')
-    parser.add_argument(
-          "--bitcoind-use-https", action='store_true',
-          help='use HTTPS to connect to bitcoind')
-    parser.add_argument(
-          "--bitcoind-timeout", type=int,
-          help='the number of seconds to wait before timing out a request')
-
-    args, _ = parser.parse_known_args()
-
-    # propagate options
-    for (argname, config_name) in zip(["bitcoind_server", "bitcoind_port", "bitcoind_user", "bitcoind_passwd", "bitcoind_timeout"], \
-                                      ["BITCOIND_SERVER", "BITCOIND_PORT", "BITCOIND_USER", "BITCOIND_PASSWD", "BITCOIND_TIMEOUT"]):
-
-        if hasattr(args, argname) and getattr(args, argname) is not None:
-
-            opts[argname] = getattr(args, argname)
-            setattr(config, config_name, getattr(args, argname))
-
-    if args.bitcoind_use_https:
-        opts['bitcoind_use_https'] = True
-
-    else:
-        opts['bitcoind_use_https'] = False
-
-    if return_parser:
-        return opts, parser
-    else:
-        return opts
 
 
 def get_implementation():
@@ -343,3 +248,94 @@ def set_implementation(impl, testset):
 
     IMPL = impl
     TESTSET = testset
+
+
+def import_blockchain( blockchain_name ):
+    """
+    Import the blockchain package we want, and make sure
+    all the required methods are there.
+    Return the (module, config) on success
+    Raise an exception on error
+    """
+
+    # override the blockchain connection factory (for testing)
+    blockchain_connect_override_module = os.getenv("VIRTUALCHAIN_MOD_BLOCKCHAIN")
+    if blockchain_connect_override_module is not None:
+
+        log.debug("Using '%s' to implement blockchain library" % blockchain_connect_override_module)
+
+        # either compiled or source...
+        mod_type = None
+        if blockchain_connect_override_module.endswith(".pyc"):
+            mod_type = imp.PY_COMPILED
+        elif blockchain_connect_override_module.endswith(".py"):
+            mod_type = imp.PY_SOURCE
+        else:
+            raise Exception("Unsupported module type: '%s'" % blockchain_connect_override_module)
+
+        # find and load the module with the desired 'connect_blockchain' method
+        mod_fd = open(blockchain_connect_override_module, "r")
+        blockchain_mod = imp.load_module("mod_blockchain", mod_fd, blockchain_connect_override_module, ("", 'r', mod_type))
+
+        try:
+            process_local_connect_blockchain = blockchain_mod.connect_blockchain
+            assert callable(process_local_connect_blockchain)
+        except Exception, e:
+            log.exception(e)
+            raise Exception("Module '%s' has no callable 'connect_blockchain' method" % blockchain_connect_override_module)
+
+        return blockchain_mod
+
+    else:
+        blockchain_package = "virtualchain.lib.blockchain.%s" % blockchain_name
+        blockchain_mod = importlib.import_module(blockchain_package)
+
+    for sym in BLOCKCHAIN_MOD_PROTOTYPE:
+        assert hasattr(blockchain_mod, sym), "Missing symbol in %s: %s" % (blockchain_package, sym)
+        assert type(getattr(blockchain_mod, sym)) in BLOCKCHAIN_MOD_PROTOTYPE[sym], "Wrong symbol type for %s in %s: %s" % (sym, blockchain_package, type(getattr(blockchain_mod, sym)))
+
+    return blockchain_mod
+
+
+def get_blockchain_config( blockchain_name, config_path ):
+    """
+    Get the config for a blockchain
+    """
+    blockchain_mod = import_blockchain(blockchain_name)
+    conf = blockchain_mod.get_blockchain_config( config_path )
+    return conf 
+
+
+def parse_blockchain_args( blockchain_name, return_parser=False, parser=None, impl=None, config_file=None ):
+    """
+    Parse blockchain-specific arguments on the command-line.
+    Options correspond to valid config options returned by the blockchain-specific get_blockchain_config
+    """
+    
+    impl = get_impl(impl)
+    if config_file is None:
+        config_file = get_config_file(impl=impl)
+    
+    conf = get_blockchain_config(blockchain_name, config_file)
+    opts = {}
+    accepted_args = []
+
+    if parser is None:
+        parser = argparse.ArgumentParser(description='%s version %s' % (impl.get_virtual_chain_name(testset=TESTSET), impl.get_virtual_chain_version()))
+
+    for key in conf:
+        if key in BLOCKCHAIN_CONFIG_REQUIRED_VALUES:
+            continue
+
+        accepted_args.append(key)
+        parser.add_argument("--" + key, help="")
+
+    for argname in accepted_args:
+        if hasattr(args, argname) and getattr(args, argname) is not None:
+            opts[argname] = getattr(args, argname)
+
+    if return_parser:
+        return opts, parser
+    else:
+        return opts
+
