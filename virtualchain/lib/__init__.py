@@ -25,9 +25,11 @@
 import config 
 import blockchain 
 import indexer 
-import workpool 
+import workpool
+import hash
 
 from config import *
 from blockchain import *
+from hash import *
 from indexer import StateEngine, get_index_range, RESERVED_KEYS
-from workpool import multiprocess_bitcoind, multiprocess_batch_size, multiprocess_pool
+from workpool import multiprocess_blockchain_client, multiprocess_batch_size, multiprocess_pool
