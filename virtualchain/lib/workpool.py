@@ -24,7 +24,7 @@
 
 from multiprocessing import Pool
 
-from config import DEBUG, configure_multiprocessing
+from config import DEBUG, configure_multiprocessing, get_logger, import_blockchain
 
 import os
 import sys
@@ -39,12 +39,11 @@ import random
 import netstring
 import traceback
 import cPickle as pickle
-import blockchain.session
 import copy
 import imp
 import platform 
 
-log = blockchain.session.get_logger("virtualchain")
+log = get_logger("virtualchain") 
 
 default_worker_env = {}
 
@@ -762,53 +761,53 @@ class Workpool(object):
 
         return rc
 
-# bitcoind just for this process
-process_local_bitcoind = None
-process_local_connect_bitcoind = None
+# blockchain client just for this process
+process_local_blockchain_client = None
+process_local_connect_blockchain = None
 
 
-def multiprocess_bitcoind(bitcoind_opts, reset=False):
+def multiprocess_blockchain_client(blockchain_client_opts, reset=False):
     """
-    Get a per-process bitcoind client.
+    Get a per-process blockchain client.
     """
 
-    global process_local_bitcoind
+    global process_local_blockchain_client
 
     if reset:
-        process_local_bitcoind = None
+        process_local_blockchain_client = None
 
-    if process_local_bitcoind is None:
-        # this proces does not yet have a bitcoind client.
+    if process_local_blockchain_client is None:
+        # this proces does not yet have a blockchain client.
         # make one.
-        if bitcoind_opts is None:
+        if blockchain_client_opts is None:
             # neither given nor globally set
-            raise Exception("No bitcoind options set.")
+            raise Exception("No blockchain client options set.")
 
-        connect_bitcoind = multiprocess_connect_bitcoind()
-        process_local_bitcoind = connect_bitcoind(bitcoind_opts)
+        connect_blockchain = multiprocess_connect_blockchain(blockchain_client_opts)
+        process_local_blockchain_client = connect_blockchain(blockchain_client_opts)
 
-    return process_local_bitcoind
+    return process_local_blockchain_client
 
 
-def multiprocess_batch_size(bitcoind_opts):
+def multiprocess_batch_size(blockchain_client_opts):
     """
     How many blocks can we be querying at once?
     """
-    num_workers, worker_batch_size = configure_multiprocessing(bitcoind_opts)
+    num_workers, worker_batch_size = configure_multiprocessing(blockchain_client_opts)
     return num_workers * worker_batch_size
 
 
-def multiprocess_pool(bitcoind_opts, python_filepath):
+def multiprocess_pool(blockchain_client_opts, python_filepath):
     """
     Create a multiprocess pool to index the blockchain, given the path to the python file to run to receive commands
     and the blockchain connection options.
     """
-    num_workers, worker_batch_size = configure_multiprocessing(bitcoind_opts)
+    num_workers, worker_batch_size = configure_multiprocessing(blockchain_client_opts)
 
-    bitcoind_opts_environ = pickle.dumps(bitcoind_opts)
+    blockchain_client_opts_environ = pickle.dumps(blockchain_client_opts)
 
     worker_env = {
-        "VIRTUALCHAIN_BITCOIND_OPTIONS": bitcoind_opts_environ
+        "VIRTUALCHAIN_BLOCKCHAIN_OPTIONS": blockchain_client_opts_environ
     }
 
     if os.environ.get("PYTHONPATH", None) is not None:
@@ -816,25 +815,28 @@ def multiprocess_pool(bitcoind_opts, python_filepath):
 
     # use full_path to python from sys.executable as default
     # this is used when PYTHONPATH is not set
-    return Workpool(num_workers, sys.executable, [python_filepath], worker_env=worker_env)
+    return Workpool(num_workers, sys.executable, [python_filepath, blockchain_client_opts['blockchain']], worker_env=worker_env)
 
 
-def multiprocess_bitcoind_opts():
+def multiprocess_blockchain_opts():
     """
-    Get multiprocess bitcoind options
+    Get multiprocess blockchain options
     """
-    bitcoind_opts_pickled = os.getenv("VIRTUALCHAIN_BITCOIND_OPTIONS")
-    bitcoind_opts = pickle.loads(bitcoind_opts_pickled)
-    return bitcoind_opts
+    blockchain_opts_pickled = os.getenv("VIRTUALCHAIN_BLOCKCHAIN_OPTIONS")
+    blockchain_opts = pickle.loads(blockchain_opts_pickled)
+    return blockchain_opts
 
 
-def multiprocess_connect_bitcoind():
+def multiprocess_connect_blockchain(blockchain_client_opts):
     """
-    Get the connect_bitcoind factory method.
+    Get the connect_blockchain factory method.
     """
-    global process_local_connect_bitcoind
-    if process_local_connect_bitcoind is None:
+    global process_local_connect_blockchain
+    if process_local_connect_blockchain is None:
+        blockchain_mod = import_blockchain(blockchain_client_opts['blockchain'])
+        process_local_connect_blockchain = blockchain_mod.connect_blockchain 
 
+        '''
         # override the blockchain connection factory (for testing)
         blockchain_connect_override_module = os.getenv("VIRTUALCHAIN_MOD_CONNECT_BLOCKCHAIN")
         if blockchain_connect_override_module is not None:
@@ -850,21 +852,23 @@ def multiprocess_connect_bitcoind():
             else:
                 raise Exception("Unsupported module type: '%s'" % blockchain_connect_override_module)
 
-            # find and load the module with the desired 'connect_bitcoind' method
+            # find and load the module with the desired 'connect_blockchain' method
             mod_fd = open(blockchain_connect_override_module, "r")
             connect_blockchain_mod = imp.load_module("connect_blockchain", mod_fd, blockchain_connect_override_module, ("", 'r', mod_type))
 
             try:
-                process_local_connect_bitcoind = connect_blockchain_mod.connect_bitcoind
-                assert hasattr(process_local_connect_bitcoind, "__call__")
+                process_local_connect_blockchain = connect_blockchain_mod.connect_blockchain
+                assert hasattr(process_local_connect_blockchain, "__call__")
             except:
-                raise Exception("Module '%s' has no callable 'connect_bitcoind' method" % blockchain_connect_override_module)
+                raise Exception("Module '%s' has no callable 'connect_blockchain' method" % blockchain_connect_override_module)
 
         else:
-            # default
-            process_local_connect_bitcoind = blockchain.session.connect_bitcoind_impl
+            # default--select the module based on which blockchain we are configured to use 
+            blockchain_mod = import_blockchain(blockchain_client_opts['blockchain'])
+            process_local_connect_blockchain = blockchain_mod.connect_blockchain
+        '''
 
-    return process_local_connect_bitcoind
+    return process_local_connect_blockchain
 
 
 def multiprocess_rpc_marshal(method_name, method_args):
@@ -883,10 +887,18 @@ def multiprocess_rpc_unmarshal(payload):
     return args[0], args[1:]
 
 
-def multiprocess_worker_main(mainloop_body):
+def multiprocess_worker_main(mainloop_body, blockchain_name):
     """
     Main loop for a worker: dispatch messages to a main-loop body
     """
+    # which blockchain are we using?
+    try:
+        blockchain_mod = import_blockchain(blockchain_name)
+    except Exception, e:
+        log.exception(e)
+        log.error("Worker %s exiting on exception" % os.getpid())
+        sys.exit(1)
+
     for (key, payload) in Workpool.worker_next_message():
         try:
             mainloop_body(key, payload)
@@ -905,9 +917,9 @@ def set_default_worker_env(worker_env):
     default_worker_env = worker_env
 
 
-def set_connect_bitcoind(connect_bitcoind):
+def set_connect_blockchain(connect_blockchain):
     """
-    Set default bitcoind connection factory.
+    Set default blockchain connection factory.
     """
-    global process_local_connect_bitcoind
-    process_local_connect_bitcoind = connect_bitcoind
+    global process_local_connect_blockchain
+    process_local_connect_blockchain = connect_blockchain
