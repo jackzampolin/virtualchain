@@ -33,13 +33,18 @@ import socket
 import os
 import sys
 import time
+
+libdir = os.path.abspath(os.path.dirname(__file__) + "../../..")
+sys.path.insert(0, libdir)
+
+from hash import bin_double_sha256
 from config import get_logger
+
 from protocoin.clients import *
 from protocoin.serializers import *
 from protocoin.fields import *
 
-import virtualchain
-import pybitcoin
+from .transactions import block_header_verify, block_verify, tx_to_hex
 import bitcoin
 
 log = get_logger()
@@ -420,7 +425,7 @@ class SPVClient(object):
         """
         prev_header = cls.read_header( headers_path, block_id - 1 )
         prev_hash = prev_header['hash']
-        return virtualchain.block_header_verify( block_header, prev_hash, block_hash )
+        return block_header_verify( block_header, prev_hash, block_hash )
 
 
     @classmethod 
@@ -438,7 +443,7 @@ class SPVClient(object):
             'tx': block_txids
         }
 
-        return virtualchain.block_verify( block_data )
+        return block_verify( block_data )
 
 
     @classmethod 
@@ -446,8 +451,8 @@ class SPVClient(object):
         """
         Calculate the hash of a transction
         """
-        tx_hex = virtualchain.tx_to_hex( tx )
-        tx_hash = pybitcoin.bin_double_sha256(tx_hex.decode('hex'))[::-1].encode('hex')
+        tx_hex = tx_to_hex( tx )
+        tx_hash = bin_double_sha256(tx_hex.decode('hex'))[::-1].encode('hex')
         return tx_hash
 
 

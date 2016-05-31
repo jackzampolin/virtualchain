@@ -27,3 +27,9 @@ from session import connect_bitcoind_impl as connect_blockchain
 from transactions import getblockcount as get_blockchain_height
 from transactions import get_nulldata_txs_in_blocks as get_virtualchain_transactions
 from session import AVERAGE_BLOCKS_PER_HOUR
+
+# for SNV
+from transactions import txid_to_block_data as snv_txid_to_block_data
+from transactions import txid_to_serial_number as snv_txid_to_serial_number
+from transactions import serial_number_to_tx as snv_serial_number_to_tx
+from transactions import parse_tx_op_return as snv_tx_parse
