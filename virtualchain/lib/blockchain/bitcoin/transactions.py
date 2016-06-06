@@ -22,6 +22,8 @@
 """
 
 from .nulldata import get_nulldata, has_nulldata
+from .scripts import *
+from .opcodes import *
 import traceback
 
 import sys
@@ -34,8 +36,8 @@ from config import MULTIPROCESS_RPC_RETRY, get_logger
 from workpool import multiprocess_blockchain_client, multiprocess_batch_size, multiprocess_rpc_marshal, Workpool, multiprocess_blockchain_opts
 from hash import bin_double_sha256
 from merkle import MerkleTree
+from transactions import VirtualOutput, VirtualInput, VirtualDataOutput, VirtualPaymentOutput, VirtualTransaction
 
-import logging
 import time
 import types
 import random
@@ -53,6 +55,10 @@ import session
 log = get_logger("virtualchain")
 
 UINT_MAX = 2**32-1
+
+# fee defaults
+STANDARD_FEE = 1000  # 1000 satoshis = 10 bits = .01 mbits = .00001 BTC
+OP_RETURN_FEE = 10000  # 10k satoshis = .0001 BTC
 
 def get_bitcoind( bitcoind_or_opts ):
    """
@@ -375,16 +381,17 @@ def getblockcount( bitcoind_or_opts ):
    
    else:
       raise Exception("Failed after %s attempts" % MULTIPROCESS_RPC_RETRY)
-   
+  
 
-
-def get_sender_and_amount_in_from_txn( tx, output_index ):
+def get_output_from_tx( tx, output_index ):
    """
-   Given a transaction, get information about the sender 
-   and the money paid.
+   Given a transaction, get information about a
+   particular output.
+
+   @tx: the transaction
+   @output_index: the index into the vout
    
-   Return a sender (a dict with a script_pubkey, amount, and list of addresses
-   within the script_pubkey), and the amount paid.
+   Return a VirtualPaymentOutput with the output fields
    """
    
    # grab the previous tx output (the current input)
@@ -403,23 +410,14 @@ def get_sender_and_amount_in_from_txn( tx, output_index ):
    
    # build and append the sender to the list of senders
    amount_in = int(prev_tx_output['value']*10**8)
-   sender = {
+   extra_fields = {
       "script_pubkey": script_pubkey.get('hex'),
       "script_type": script_pubkey.get('type'),
-      "amount": amount_in,
-      "addresses": script_pubkey.get('addresses')
+      "script_asm": script_pubkey.get('asm')
    }
-   
-   return sender, amount_in
 
-
-def get_total_out(outputs):
-    total_out = 0
-    # analyze the outputs for the total amount out
-    for output in outputs:
-        amount_out = int(output['value']*10**8)
-        total_out += amount_out
-    return total_out
+   sender = VirtualPaymentOutput( script_pubkey['hex'], amount_in, script_pubkey.get('addresses'), **extra_fields )
+   return sender
  
 
 def process_nulldata_tx_async( workpool, bitcoind_opts, tx ):
@@ -509,24 +507,7 @@ def future_get_result( fut, timeout ):
    return pickle.loads( result )
 
 
-def get_block_goodput( block_data ):
-   """
-   Find out how much goodput data is present in a block's data
-   """
-   if block_data is None:
-      return 0
-   
-   sum( [len(h) for h in block_data] )
-   
-
-def bandwidth_record( total_time, block_data ):
-   return {
-      "time":  total_time,
-      "size":  get_block_goodput( block_data )
-   }
-
-
-def tx_is_coinbase( tx ):
+def bitcoin_tx_is_coinbase( tx ):
     """
     Is a transaction a coinbase transaction?
     """
@@ -536,7 +517,8 @@ def tx_is_coinbase( tx ):
 
     return False
 
-def tx_to_hex( tx ):
+
+def bitcoin_tx_to_hex( tx ):
      """
      Convert a bitcoin-given transaction into its hex string.
      Does NOT work on coinbase transactions.
@@ -580,11 +562,11 @@ def tx_to_hex( tx ):
      return str(tx_serialized)
 
 
-def tx_verify( tx, tx_hash ):
+def bitcoin_tx_verify( tx, tx_hash ):
     """
     Confirm that a bitcoin transaction has the given hash.
     """
-    tx_serialized = tx_to_hex( tx )
+    tx_serialized = bitcoin_tx_to_hex( tx )
     tx_reversed_bin_hash = bin_double_sha256( binascii.unhexlify(tx_serialized) )
     tx_candidate_hash = binascii.hexlify(tx_reversed_bin_hash[::-1])
 
@@ -636,7 +618,210 @@ def block_verify( block_data ):
     return root_hash == str(block_data['merkleroot'])
 
 
-def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block_hash=None ):
+def parse_op_return_payload( magic, op_return_payload ):
+    """
+    Get the opcode and data from an op_return's payload
+    Return op, data on success
+    Return None, None on failure
+    """
+    if magic != op_return_payload[0:1]:
+        # not a valid operation
+        return (None, None)
+
+    opcode = op_return_payload[0]
+    payload = op_return[1:]
+
+    return (opcode, payload)
+
+
+def pop_length( bin_str ):
+    """
+    Given a string with a varint, 
+    pop the varint.
+
+    Return the value, and the popped string on success
+    Return None, None on error
+    """
+    if len(bin_str) < 2:
+        return None, None
+
+    l = 0
+    op = ord(bin_str[0])
+    bin_str = bin_str[1:]
+    if op == opcodes.OP_PUSHDATA1:
+        # 1-byte read
+        l = ord(bin_str[0])
+        bin_str = bin_str[1:]
+
+    elif op == opcodes.OP_PUSHDATA2:
+        # 2-byte read
+        if len(bin_str) < 2:
+            return None, None
+
+        l = ord(bin_str[0]) * (2**8) + ord(bin_str[1])
+        bin_str = bin_str[2:]
+
+        if len(bin_str) < l:
+            return None, None
+
+    elif op == opcodes.OP_PUSHDATA4:
+        # 4-byte read 
+        if len(bin_str) < 4:
+            return None, None
+
+        l = ord(bin_str[0]) * (2**24) + ord(bin_str[1]) * (2**16) + ord(bin_str[2]) * (2**8) + ord(bin_str[3])
+        bin_str = bin_str[4:]
+        if len(bin_str) < l:
+            return None, None
+
+    else:
+        l = op
+        if len(bin_str) < l:
+            return None, None
+    
+    return l, bin_str 
+    
+
+def pop_string( bin_str ):
+    """
+    Given a string headed by a varint,
+    get $varint bytes.
+    Return the string, and the remaining bytes on success.
+    Return None, None on error
+    """
+    l, bin_str = pop_length(bin_str)
+    if l is None or bin_str is None:
+        return None, None 
+
+    b = bin_str[:l]
+    bin_str = bin_str[l+1:]
+
+    return b, bin_str
+
+
+def parse_multisig_redeem_script( redeem_script_bin ):
+    """
+    Parse a multisig redeem script.
+    Return  M, N, and the list of public keys (as hex strings)
+    Return None, None, None on failure.
+    """
+    failure = (None, None, None)
+    m = ord(redeem_script_bin[0])
+    if m < opcodes.OP_1 or m > opcodes.OP_16:
+        # not multisig 
+        return failure
+
+    m -= (opcodes.OP_1 - 1)
+    redeem_script_bin = redeem_script_bin[1:]
+    
+    # get all pubkeys
+    pubkeys = []
+    for i in xrange(0, m):
+        keylen, redeem_script_bin = pop_length( redeem_script_bin )
+        pubkeys.append( hexlify(redeem_script_bin[:keylen]) )
+        redeem_script_bin = redeem_script_bin[:keylen]
+
+    # get n
+    n = ord(redeem_script_bin[0])
+    redeem_script_bin = redeem_script_bin[1:]
+    if n < opcodes.OP_1 or n > opcodes.OP_16:
+        # not multisig
+        return failure
+
+    n -= (opcodes.OP_1 - 1)
+    if n < m:
+        # invalid 
+        return failure
+
+    # last byte should be OP_CHECKMULTISIG 
+    if len(redeem_script_bin) != 1:
+        return failure
+
+    if ord(redeem_script_bin[0]) != opcodes.OP_CHECKMULTISIG:
+        return failure
+
+    return m, n, pubkeys
+    
+
+def parse_multisig_info( input_hex ):
+    """
+    Given an asm string from a scriptsig,
+    try to parse it as a multisig input.
+    Return the (m, n, list of signatures on success (as hex strings), and the list of public keys in the redeem script)
+    Return None, None, None, None if not a multisig input.
+    """
+    sigs = []
+    input_bin = unhexlify(input_hex)
+    failure = (None, None, None, None)
+
+    # first byte must be OP_0
+    if ord(input_bin[0]) != opcodes.OP_0:
+        return failure
+
+    input_bin = input_bin[1:]
+    strings = []
+    while len(input_bin) > 0:
+        sig, input_bin = pop_string(input_bin)
+        if sig is None:
+            return failure
+
+        strings.append(sig)
+
+    redeem_script = strings.pop()
+
+    # extract keys 
+    m, n, public_keys = parse_multisig_redeem_script( redeem_script )
+    if m is None or n is None or public_keys is None:
+        return failure
+
+    # must be m signatures
+    if len(strings) != m:
+        return failure
+        
+    return m, n, strings, public_keys
+
+
+def get_public_keys_and_signatures( tx_input ):
+    """
+    Given a bitcoin-given vin, find the public keys.
+    Returns a (list of signatures, list of public keys)
+    Returns None,None on error
+    """
+
+    failure = (None, None) 
+    input_scriptsig = tx_input.get('scriptSig', None )
+    if input_scriptsig is None:
+        # no scriptsig, no public keys
+        return failure
+        
+    input_hex = input_scriptsig.get("hex")
+    input_asm = input_scriptsig.get("asm")
+    if input_hex is None:
+        return failure
+
+    if input_asm is None:
+        return failure
+
+    # is this a p2pkh input?
+    if input_asm.split(" ") == 2:
+        signature_hex, pubkey_hex = input_asm.split(" ")
+        try:
+            pubkey = ECPublicKey(str(pubkey_hex))
+        except Exception, e:
+            continue
+
+        return [signature_hex], [pubkey_hex]
+
+    # is this a p2sh multisig input?
+    m, n, signatures, public_keys = parse_multisig_info( input_hex )
+    if public_keys is not None:
+        return (signatures, public_keys)
+
+    return failure
+
+
+
+def get_virtualchain_transactions( workpool, bitcoind_opts, magic, blocks_ids, first_block_hash=None ):
    """
    Obtain the set of transactions over a range of blocks that have an OP_RETURN with nulldata.
    Each returned transaction record will contain:
@@ -655,7 +840,6 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
    """
    
    nulldata_tx_map = {}    # {block_number: {"tx": [tx]}}
-   block_bandwidth = {}    # {block_number: {"time": time taken to process, "size": number of bytes}}
    nulldata_txs = []
    
    # break work up into slices of blocks, so we don't run out of memory 
@@ -670,17 +854,13 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
       block_hash_futures = []
       block_data_futures = []
       tx_futures = []
-      nulldata_tx_futures = []
-      all_nulldata_tx_futures = []
-      block_times = {}          # {block_number: time taken to process}
+      sender_tx_futures = []
       
       block_slice = blocks_ids[ (slice_count * slice_len) : min((slice_count+1) * slice_len, len(blocks_ids)) ]
       if len(block_slice) == 0:
          log.debug("Zero-length block slice")
          break
       
-      start_slice_time = time.time()
-     
       # get all block hashes 
       for block_number in block_slice:
          
@@ -690,9 +870,6 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
          block_hash_futures.append( (block_number, block_hash_fut) ) 
    
       # coalesce all block hashes
-      block_hash_time_start = time.time()
-      block_hash_time_end = 0
-      
       for i in xrange(0, len(block_hash_futures)):
          
          block_number, block_hash_fut = future_next( block_hash_futures, lambda f: f[1] )
@@ -708,9 +885,6 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
 
          else:
              raise Exception("BUG: Block %s: no block hash" % block_number)
-     
-      block_data_time_start = time.time()
-      block_data_time_end = 0
      
       # coalesce block data
       for i in xrange(0, len(block_data_futures)):
@@ -779,9 +953,6 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
             
             raise Exception("BUG: Zero-transaction block %s" % block_number)
            
-      block_tx_time_start = time.time()
-      block_tx_time_end = 0
-      
       # coalesce raw transaction queries...
       for i in xrange(0, len(tx_futures)):
          
@@ -792,7 +963,7 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
          tx = future_get_result( tx_fut, 1000000000000000L )
          
          #if len(tx['vin']) > 0 and 'coinbase' not in tx['vin'][0].keys():
-         if not tx_is_coinbase( tx ):
+         if not bitcoin_tx_is_coinbase( tx ):
 
              # verify non-coinbase transaction 
              tx_hash = tx['txid']
@@ -803,21 +974,12 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
             
             # go get input transactions for this transaction (since it's the one with nulldata, i.e., a virtual chain operation),
             # but tag each future with the hash of the current tx, so we can reassemble the in-flight inputs back into it. 
-            nulldata_tx_futs_and_output_idxs = process_nulldata_tx_async( workpool, bitcoind_opts, tx )
-            nulldata_tx_futures.append( (block_number, tx_index, tx, nulldata_tx_futs_and_output_idxs) )
-            
-         else:
-            
-            # maybe done with this block
-            # NOTE will be called multiple times; we expect the last write to be the total time taken by this block
-            total_time = time.time() - block_times[ block_number ]
-            block_bandwidth[ block_number ] = bandwidth_record( total_time, None )
-             
-      block_nulldata_tx_time_start = time.time()
-      block_nulldata_tx_time_end = 0
-      
+            sender_futs_and_output_idxs = process_nulldata_tx_async( workpool, bitcoind_opts, tx )
+            sender_tx_futures.append( (block_number, tx_index, tx, sender_futs_and_output_idxs) )
+     
+
       # coalesce queries on the inputs to each nulldata transaction from this block...
-      for (block_number, tx_index, tx, nulldata_tx_futs_and_output_idxs) in nulldata_tx_futures:
+      for (block_number, tx_index, tx, sender_futs_and_output_idxs) in sender_tx_futures:
          
          if ('vin' not in tx) or ('vout' not in tx) or ('txid' not in tx):
             continue 
@@ -825,25 +987,25 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
          inputs = tx['vin']
          outputs = tx['vout']
          
-         total_in = 0   # total input paid
+         # total_in = 0   # total input paid
          senders = []
          ordered_senders = []
 
-         if tx_is_coinbase( tx ):
+         if bitcoin_tx_is_coinbase( tx ):
              # skip coinbase 
              continue
          
-         # gather this tx's nulldata-bearing transactions
-         for i in xrange(0, len(nulldata_tx_futs_and_output_idxs)):
+         # gather this tx's inputs' outputs (so we know who sent which input)
+         for i in xrange(0, len(sender_futs_and_output_idxs)):
             
-            input_idx, input_tx_fut, tx_output_index = future_next( nulldata_tx_futs_and_output_idxs, lambda f: f[1] )
+            input_idx, input_tx_fut, tx_output_index = future_next( sender_futs_and_output_idxs, lambda f: f[1] )
             
             # NOTE: interruptable blocking get(), but should not block since future_next found one that's ready
             input_tx = future_get_result( input_tx_fut, 1000000000000000L )
             input_tx_hash = input_tx['txid']
 
             # verify (but skip coinbase) 
-            if not tx_is_coinbase( input_tx ):
+            if not bitcoin_tx_is_coinbase( input_tx ):
                 try:
                     if not tx_verify( input_tx, input_tx_hash ):
                         raise Exception("Input transaction hash mismatch %s from tx %s (index %s)" % (input_tx['txid'], tx['txid'], tx_output_index))
@@ -852,17 +1014,18 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
                     pp.pprint(input_tx)
                     raise
 
-            sender, amount_in = get_sender_and_amount_in_from_txn( input_tx, tx_output_index )
-            
-            if sender is None or amount_in is None:
-               continue
-            
-            total_in += amount_in 
+            sender = get_output_from_tx( input_tx, tx_output_index )
+            if sender is None:
+                continue
+
+            amount_in = sender.amount()
+            # total_in += amount_in 
             
             # preserve sender order...
             ordered_senders.append( (input_idx, sender) )
          
          # sort on input_idx, so the list of senders matches the given transaction's list of inputs
+         # that is, senders and tx['vin'] are in one-to-one correspondence by index.
          ordered_senders.sort()
          senders = [sender for (_, sender) in ordered_senders]
 
@@ -870,16 +1033,15 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
          if len(senders) != len(inputs):
              raise Exception("Sender/inputs mismatch: %s != %s\n" % (len(senders), len(inputs)))
          
-         total_out = get_total_out( outputs )
-         nulldata = get_nulldata( tx )
-      
-         # extend tx to explicitly record its nulldata (i.e. the virtual chain op),
-         # the list of senders (i.e. their script hexs),
-         # and the total amount paid
-         tx['nulldata'] = nulldata
-         tx['senders'] = senders
-         tx['fee'] = total_in - total_out
+         # merge senders into vin 
+         for i in xrange(0, len(inputs)):
+             tx['vin'][i]['_virtualchain_sender'] = senders[i]
          
+         # extract public keys and signatures 
+         for i in xrange(0, len(inputs)):
+             tx['vin'][i]['_virtualchain_public_keys'] = get_public_keys( inputs[i] )
+             tx['vin'][i]['_virtualchain_signatures'] = get_signatures( inputs[i] )
+
          # track the order of nulldata-containing transactions in this block
          if not nulldata_tx_map.has_key( block_number ):
             nulldata_tx_map[ block_number ] = [(tx_index, tx)]
@@ -887,78 +1049,67 @@ def get_nulldata_txs_in_blocks( workpool, bitcoind_opts, blocks_ids, first_block
          else:
             nulldata_tx_map[ block_number ].append( (tx_index, tx) )
             
-         # maybe done with this block
-         # NOTE will be called multiple times; we expect the last write to be the total time taken by this block
-         total_time = time.time() - block_times[ block_number ]
-         block_bandwidth[ block_number ] = bandwidth_record( total_time, None )
-            
-      # record bandwidth information 
-      for block_number in block_slice:
-         
-         block_data = None
-         
-         if nulldata_tx_map.has_key( block_number ):
-            
-            tx_list = nulldata_tx_map[ block_number ]     # [(tx_index, tx)]
-            tx_list.sort()                                # sorts on tx_index--preserves order in the block
-            
-            txs = [ tx for (_, tx) in tx_list ]
-            block_data = txs 
-            
-         if not block_bandwidth.has_key( block_number ):
-            
-            # done with this block now 
-            total_time = time.time() - block_times[ block_number ]
-            block_bandwidth[ block_number ] = bandwidth_record( total_time, block_data )
-         
-         
-      block_tx_time_end = time.time()
-      block_nulldata_tx_time_end = time.time()
-   
-      end_slice_time = time.time()
-      
-      total_processing_time = sum( map( lambda block_id: block_bandwidth[block_id]["time"], block_bandwidth.keys() ) )
-      total_data = sum( map( lambda block_id: block_bandwidth[block_id]["size"], block_bandwidth.keys() ) )
-      
-      block_hash_time = block_hash_time_end - block_hash_time_start 
-      block_data_time = block_data_time_end - block_data_time_start
-      block_tx_time = block_tx_time_end - block_tx_time_start 
-      block_nulldata_tx_time = block_nulldata_tx_time_end - block_nulldata_tx_time_start
-      
-      # log some stats...
-      log.debug("blocks %s-%s (%s):" % (block_slice[0], block_slice[-1], len(block_slice)) )
-      log.debug("  Time total:     %s" % total_processing_time )
-      log.debug("  Data total:     %s" % total_data )
-      log.debug("  Total goodput:  %s" % (total_data / (total_processing_time + 1e-7)))
-      log.debug("  block hash time:        %s" % block_hash_time)
-      log.debug("  block data time:        %s" % block_data_time)
-      log.debug("  block tx time:          %s" % block_tx_time)
-      log.debug("  block nulldata tx time: %s" % block_nulldata_tx_time)
-      
       # next slice
       slice_count += 1
-   
-   # get the blockchain-ordered list of nulldata-containing transactions.
-   # this is the blockchain-agreed list of all virtual chain operations, as well as the amount paid per transaction and the 
-   # principal(s) who created each transaction.
-   # convert {block_number: [tx]} to [(block_number, [tx])] where [tx] is ordered by the order in which the transactions occurred in the block
-   for block_number in blocks_ids:
-      
-      txs = []
-      
-      if block_number in nulldata_tx_map.keys():
-         tx_list = nulldata_tx_map[ block_number ]     # [(tx_index, tx)]
-         tx_list.sort()                                # sorts on tx_index--preserves order in the block
-         
-         # preserve index
-         for (tx_index, tx) in tx_list:
-             tx['txindex'] = tx_index
+ 
+   # convert to virtualchain format
+   vtxs = []
+   for block_number in block_ids:
+       if block_number in nulldata_tx_map.keys():
+           # payload-bearing transactions for this block...
+           tx_list = nulldata_tx_map[ block_number ]  # [(tx_index, tx)]
+           tx_list.sort()
+           
+           # preserve index 
+           for (tx_index, tx) in tx_list:
+               tx['txindex'] = tx_index
 
-         txs = [ tx for (_, tx) in tx_list ]
+            txs = [tx for (_, tx) in tx_list]
 
-      nulldata_txs.append( (block_number, txs) )
-      
-   return nulldata_txs
+        # build virtual transactions
+        for tx in txs:
+            vtx_inputs = []
+            vtx_outputs = []
+            payload = None
+            valid = True
+
+            for inp in tx['vin']:
+                if inp.has_key('scriptSig'):
+                    # pass along 
+                    public_keys, signatures = get_public_keys_and_signatures( inp )
+                    if public_keys is None or signatures is None:
+                        log.error("Unrecognized scriptSig in transaction %s: %s" % (tx['txid'], inp['scriptSig'].get('hex')))
+                        valid = False
+                        break
+
+                    vtx_in = VirtualInput( inp['scriptSig']['hex'], public_keys, signatures, scriptSig=inp['scriptSig'], sender=inp['_virtualchain_sender'], txid=inp['txid'] )
+                    vtx_inputs.append( vtx_in )
+
+            if not valid:
+                continue
+
+            for outp in tx['vout']:
+                amount = int(outp['value'] * (10**8))
+                if outp.has_key('scriptPubKey'):
+                    if outp['scriptPubKey']['type'] == 'nulldata':
+                        # pass along data output
+                        assert payload is None, "More than one OP_RETURN transaction in %s" % tx['txid']
+                        hex_script = outp['scriptPubKey']['hex'].decode('hex')
+                        payload = hex_script[4:]
+                        op, data = parse_op_return_payload( magic, payload )
+                        vtx_out = VirtualDataOutput( outp['scriptPubKey']['hex'], op, data, amount=amount, script_pubkey=outp['scriptPubKey'] ) 
+                        vtx_outputs.append( vtx_out )
+
+                    else:
+                        # pass along value output 
+                        vtx_out = VirtualPaymentOutput( outp['scriptPubKey']['hex'], amount, outp['scriptPubKey'].get('addresses', []), script_pubkey=outp['scriptPubKey'] )
+                        vtx_outputs.append( vtx_out )
+
+            assert payload is not None, "No OP_RETURN transaction in %s" % tx['txid']
+            vtx = VirtualTransaction( block_number, tx['txid'], tx['txindex'], vtx_inputs, vtx_outputs )
+            vtxs.append( vtx )
+
+   return vtxs
 
 
 def txid_to_block_data(txid, bitcoind_proxy, blockchain_headers_path):
@@ -986,6 +1137,8 @@ def txid_to_block_data(txid, bitcoind_proxy, blockchain_headers_path):
             log.error("Unable to obtain block data; retrying...")
             time.sleep(timeout)
             timeout = timeout * 2 + random.random() * timeout
+
+    SPVClient.init(blockchain_headers_path)
 
     # first, can we trust this block? is it in the SPV headers?
     untrusted_block_header_hex = block_header_to_hex(untrusted_block_data, untrusted_block_data['previousblockhash'])
@@ -1069,6 +1222,8 @@ def serial_number_to_tx(serial_number, bitcoind_proxy, blockchain_headers_path )
             time.sleep(timeout)
             timeout = timeout * 2 + random.random() * timeout
 
+    SPVClient.init(blockchain_headers_path)
+
     rc = SPVClient.sync_header_chain(blockchain_headers_path, bitcoind_proxy.opts['bitcoind_server'], block_id)
     if not rc:
         log.error("Failed to synchronize SPV header chain up to %s" % block_id)
@@ -1111,39 +1266,262 @@ def serial_number_to_tx(serial_number, bitcoind_proxy, blockchain_headers_path )
     return tx
 
 
-def parse_tx_op_return(tx):
-    """
-    Given a transaction, locate its OP_RETURN and parse
-    out its opcode and payload.
-    Return (opcode, payload) on success
-    Return (None, None) if there is no OP_RETURN, or if it's not a blockchain ID operation.
-    """
+def calculate_change_amount(inputs, send_amount, fee):
+    # calculate the total amount  coming into the transaction from the inputs
+    total_amount_in = sum([input['value'] for input in inputs])
+    # change = whatever is left over from the amount sent & the transaction fee
+    change_amount = total_amount_in - send_amount - fee
+    # check to ensure the change amount is a non-negative value and return it
+    if change_amount < 0:
+        raise Exception('Not enough inputs for transaction.')
 
-    # find OP_RETURN output
-    op_return = None
-    outputs = tx['vout']
+    return change_amount
+
+
+def make_pay_to_address_outputs(to_address, send_amount, inputs, change_address,
+                                fee=STANDARD_FEE):
+    """ Builds the outputs for a "pay to address" transaction.
+    """
+    return [
+        # main output
+        { "script_hex": make_pay_to_address_script(to_address), "value": send_amount },
+        # change output
+        { "script_hex": make_pay_to_address_script(change_address),
+          "value": calculate_change_amount(inputs, send_amount, fee)
+        }
+    ]
+
+def make_op_return_outputs(data, inputs, change_address, fee=OP_RETURN_FEE,
+                           send_amount=0, format='bin'):
+    """ Builds the outputs for an OP_RETURN transaction.
+    """
+    return [
+        # main output
+        { "script_hex": make_op_return_script(data, format=format), "value": send_amount },
+        # change output
+        { "script_hex": make_pay_to_address_script(change_address),
+          "value": calculate_change_amount(inputs, send_amount, fee)
+        }
+    ]
+
+
+def bitcoin_tx_deserialize( tx_hex ):
+    """
+    Given a serialized transaction, return its inputs, outputs, locktime, and version
+    Each input will have:
+    * transaction_hash: string 
+    * output_index: int 
+    * [optional] sequence: int 
+    * [optional] script_sig: string
+    
+    Each output will have:
+    * value: int 
+    * script_hex: string
+
+    Return (inputs, outputs, locktime, version)
+    """
+    
+    tx = bitcoin.deserialize( tx_hex )
+    inputs = tx["ins"]
+    outputs = tx["outs"]
+    
+    ret_inputs = []
+    ret_outputs = []
+    
+    for inp in inputs:
+        ret_inp = {
+            "transaction_hash": inp["outpoint"]["hash"],
+            "output_index": int(inp["outpoint"]["index"]),
+        }
+        
+        if "sequence" in inp:
+            ret_inp["sequence"] = int(inp["sequence"])
+            
+        if "script" in inp:
+            ret_inp["script_sig"] = inp["script"]
+            
+        ret_inputs.append( ret_inp )
+        
     for out in outputs:
-        if int(out["scriptPubKey"]['hex'][0:2], 16) == pybitcoin.opcodes.OP_RETURN:
-            op_return = out['scriptPubKey']['hex'].decode('hex')
-            break
-
-    if op_return is None:
-        pp = pprint.PrettyPrinter()
-        pp.pprint(tx)
-        log.error("transaction has no OP_RETURN output")
-        return (None, None)
-
-    # [0] is OP_RETURN, [1] is the length; [2:4] are 'id', [4] is opcode
-    magic = op_return[2:4]
-
-    if magic != BLOCKCHAIN_ID_MAGIC:
-        # not a blockchain ID operation
-        log.error("OP_RETURN output does not encode a blockchain ID operation")
-        return (None, None)
-
-    opcode = op_return[4]
-    payload = op_return[5:]
-
-    return (opcode, payload)
+        ret_out = {
+            "value": out["value"],
+            "script_hex": out["script"]
+        }
+        
+        ret_outputs.append( ret_out )
+        
+    return ret_inputs, ret_outputs, tx["locktime"], tx["version"]
 
 
+def bitcoin_tx_serialize( inputs, outputs, locktime=0, version=1 ):
+    """
+    Given (possibly signed) inputs and outputs, convert them 
+    into a hex string suitable for broadcasting.
+    Each input must have:
+    * transaction_hash: string 
+    * output_index: int 
+    * [optional] sequence: int 
+    * [optional] script_sig: str 
+    
+    Each output must have:
+    * value: int 
+    * script_hex: string
+    """
+    
+    tmp_inputs = []
+    tmp_outputs = []
+    
+    # convert to a format bitcoin understands
+    for inp in inputs:
+        tmp_inp = {
+            "outpoint": {
+                "index": inp["output_index"],
+                "hash": inp["transaction_hash"]
+            }
+        }
+        if "sequence" in inp:
+            tmp_inp["sequence"] = inp["sequence"]
+        else:
+            tmp_inp["sequence"] = 2**32 - 1     # max uint32
+            
+        if "script_sig" in inp:
+            tmp_inp["script"] = inp["script_sig"]
+        else:
+            tmp_inp["script"] = ""
+            
+        tmp_inputs.append( tmp_inp )
+        
+    for out in outputs:
+        tmp_out = {
+            "value": out["value"],
+            "script": out["script_hex"]
+        }
+        
+        tmp_outputs.append( tmp_out )
+        
+    txobj = {
+        "locktime": locktime,
+        "version": version,
+        "ins": tmp_inputs,
+        "outs": tmp_outputs
+    }
+    
+    return bitcoin.serialize( txobj )
+    
+
+def bitcoin_tx_serialize_and_sign_multi( inputs, outputs, private_keys ):
+    """
+    Given a list of inputs, outputs, private keys, and optionally a partially-signed transaction:
+    * make a transaction out of the inputs and outputs 
+    * sign input[i] with private_key[i]
+    
+    Return the signed tx on success
+    """
+    
+    if len(inputs) != len(private_keys):
+        raise Exception("Must have the same number of private keys as inputs")
+    
+    private_key_objs = []
+    for pk in private_keys:
+        if isinstance( pk, ECPrivateKey ):
+            private_key_objs.append( pk )
+        else:
+            private_key_objs.append( ECPrivateKey( pk ) )
+            
+    # make the transaction 
+    unsigned_tx = bitcoin_tx_serialize( inputs, outputs )
+    
+    # sign with the appropriate private keys 
+    for i in xrange(0, len(inputs)):
+        signed_tx = bitcoin.sign( unsigned_tx, i, private_key_objs[i].to_hex() )
+        unsigned_tx = signed_tx 
+        
+    return unsigned_tx 
+
+
+def bitcoin_tx_serialize_and_sign( inputs, outputs, private_key ):
+    """
+    Create a serialized transaction and sign each input with the same private key.
+    Useful for making a tx that is sent from one key.
+    """
+    return bitcoin_tx_serialize_and_sign_multi( inputs, outputs, [private_key] * len(inputs) )
+
+
+def bitcoin_tx_extend( partial_tx_hex, new_inputs, new_outputs ):
+    """
+    Given an unsigned serialized transaction, add more inputs and outputs to it.
+    """
+    
+    # recover tx
+    inputs, outputs, locktime, version = bitcoin_tx_deserialize( partial_tx_hex )
+    
+    # new tx
+    new_unsigned_tx = bitcoin_tx_serialize( inputs + new_inputs, outputs + new_outputs, locktime, version )
+        
+    return new_unsigned_tx
+
+    
+def bitcoin_tx_output_is_op_return( output ):
+    """
+    Is an output's script an OP_RETURN script?
+    """
+    return int( output["script_hex"][0:2], 16 ) == OP_RETURN
+    
+
+def bitcoin_tx_sign_output( unsigned_tx, output_index, privkey_hex ):
+    """
+    Sign an output in a transaction
+    """
+    return bitcoin.sign( unsigned_tx, output_index, privkey_hex )
+
+
+# driver method 
+def tx_parse( tx_str ):
+    """
+    Parse a transaction
+    """
+    inputs, outputs, locktime, version = bitcoin_tx_deserialize( tx_str )
+    return {
+        "blockchain": "bitcoin",
+        "inputs": inputs,
+        "outputs": outputs,
+        "locktime": locktime,
+        "version": version
+    }
+
+
+# driver method 
+def tx_serialize( vinputs, voutputs, **fields ):
+    """
+    Serialize a transaction, from its virtual inputs and virtual outputs
+    """
+    locktime = 0
+    version = 1
+    if "locktime" in fields:
+        locktime = fields['locktime']
+    if 'version' in fields:
+        version = fields['version']
+
+    # convert to bitcoin outputs 
+    outputs = []
+
+    for vout in voutputs:
+        if vout.type() == "payment":
+            outputs
+    
+    return bitcoin_tx_serialize( tx_dict['inputs'], tx_dict['outputs'], tx_dict['locktime'], tx_dict['version'] )
+
+
+# driver method 
+def tx_serialize_sign( inputs, outputs, private_key, **fields ):
+    """
+    Serialize and sign a transaction, from its virtual inputs and virtual outputs
+    """ 
+    locktime = 0
+    version = 1
+    if "locktime" in fields:
+        locktime = fields['locktime']
+    if 'version' in fields:
+        version = fields['version']
+
+    return bitcoin_tx_serialize_and_sign( tx_dict['inputs'], tx_dict['outputs'], private_key )
