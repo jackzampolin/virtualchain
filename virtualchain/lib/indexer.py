@@ -215,6 +215,13 @@ class StateEngine( object ):
             sys.exit(1)
 
 
+    def magic(self):
+        """
+        Get magic transaction identifier
+        """
+        return self.magic_bytes
+
+
     def save_num_vtxs( self, block_number, num_vtxs, impl=None ):
         """
         Save the number of virtual transactions present in this block.
@@ -805,7 +812,7 @@ class StateEngine( object ):
    
     def parse_transaction( self, block_id, tx ):
         """
-        Given a block ID and an OP_RETURN transaction, 
+        Given a block ID and virtualchain transaction, 
         try to parse it into a virtual chain operation.
         
         Use the implementation's 'db_parse' method to do so.
@@ -821,38 +828,49 @@ class StateEngine( object ):
         Return None on error
         """
         
-        op_return_hex = tx['nulldata']
+        """
+        payload_hex = tx['nulldata']
         inputs = tx['vin']
         outputs = tx['vout']
         senders = tx['senders']
         fee = tx['fee']
+        txid = tx['txid']
+        txindex = tx['txindex'] 
+        """
+        payload_hex = tx.payload()
+        inputs = tx.inputs()
+        outputs = tx.outputs()
+        senders =
+        fee = tx.fee()
+        txid = tx.txid()
+        txindex = tx.txindex()
         
-        if not is_hex(op_return_hex):
+        if not is_hex(payload_hex):
             # not a valid hex string 
             return None
         
-        if len(op_return_hex) % 2 != 0:
+        if len(payload_hex) % 2 != 0:
             # not valid hex string 
             return None
         
         try:
-            op_return_bin = binascii.unhexlify( op_return_hex )
+            payload_bin = binascii.unhexlify( payload_hex )
         except Exception, e:
-            log.error("Failed to parse transaction: %s (OP_RETURN = %s)" % (tx, op_return_hex))
+            log.error("Failed to parse transaction: %s (payload = %s)" % (tx, payload_hex))
             raise e
         
-        if not op_return_bin.startswith( self.magic_bytes ):
+        if not payload_bin.startswith( self.magic_bytes ):
             return None
         
-        op_code = op_return_bin[ len(self.magic_bytes) ]
+        op_code = payload_bin[ len(self.magic_bytes) ]
         
         if op_code not in self.opcodes:
             return None 
         
         # looks like a valid op.  Try to parse it.
-        op_payload = op_return_bin[ len(self.magic_bytes)+1: ]
+        op_payload = payload_bin[ len(self.magic_bytes)+1: ]
         
-        op = self.impl.db_parse( block_id, tx['txid'], tx['txindex'], op_code, op_payload, senders, inputs, outputs, fee, db_state=self.state )
+        op = self.impl.db_parse( block_id, txid, txindex, op_code, op_payload, senders, inputs, outputs, fee, db_state=self.state )
         
         if op is None:
             # not valid 
@@ -865,8 +883,8 @@ class StateEngine( object ):
         op['virtualchain_fee'] = fee
         op['virtualchain_block_number'] = block_id
         op['virtualchain_accepted'] = False       # not yet accepted
-        op['virtualchain_txid'] = tx['txid']
-        op['virtualchain_txindex'] = tx['txindex']
+        op['virtualchain_txid'] = txid
+        op['virtualchain_txindex'] = txindex
         
         return op
    
@@ -882,7 +900,6 @@ class StateEngine( object ):
         for i in xrange(0,len(txs)):
             
             tx = txs[i]
-            
             op = self.parse_transaction( block_id, tx )
             
             if op is not None:
@@ -1118,6 +1135,37 @@ class StateEngine( object ):
         return self.pool
 
 
+    @classmethod 
+    def group_virtual_transactions_by_block( virtual_txs ):
+        """
+        Given a list of virtualchain transactions,
+        group them by block ID and then order them by
+        virtual index
+        """
+        def cmp_virtual_transactions(vtx1, vtx2):
+            if vtx1.txindex() < vtx2.txindex():
+                return -1 
+
+            elif vtx1.txindex() == vtx2.txindex():
+                return 0
+
+            else:
+                return 1
+
+        ret = {}
+        for vtx in virtual_txs:
+            block_id = vtx.block_id()
+            if not ret.has_key(block_id):
+                ret[block_id] = []
+
+            ret[block_id].append( vtx )
+
+        for block_id, vtxs in ret:
+            ret[block_id].sort( cmp=cmp_virtual_transactions )
+
+        return ret
+
+
     @classmethod
     def build( cls, blockchain_opts, end_block_id, state_engine ):
         """
@@ -1181,9 +1229,12 @@ class StateEngine( object ):
                 block_ids = range( block_id, min(block_id + worker_batch_size * num_workers, end_block_id) )
                
                 # returns: [(block_id, txs)]
-                block_ids_and_txs = blockchain_mod.get_virtualchain_transactions( state_engine.get_workpool(), blockchain_opts, block_ids )
-                
-                # process in order by block ID
+                # block_ids_and_txs = blockchain_mod.get_virtualchain_transactions( state_engine.get_workpool(), blockchain_opts, block_ids )
+                virtual_transactions = blockchain_mod.get_virtualchain_transactions( state_engine.get_workpool(), blockchain_opts, state_engine.magic(), block_ids )
+
+                # put in order as [(block_id, txs)], ordered on block_id
+                grouped_vtxs = cls.group_virtual_transactions_by_block( virtual_transactions)
+                block_ids_and_txs = grouped_vtxs.items()
                 block_ids_and_txs.sort()
                
                 for processed_block_id, txs in block_ids_and_txs:
