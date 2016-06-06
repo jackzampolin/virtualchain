@@ -60,6 +60,9 @@ BLOCKCHAIN_MOD_PROTOTYPE = {
     "connect_blockchain": [types.FunctionType, callable],
     "get_blockchain_height": [types.FunctionType, callable],
     "get_virtualchain_transactions": [types.FunctionType, callable],
+    "snv_txid_to_block_data": [types.FunctionType, callable],
+    "snv_serial_number_to_tx_data": [types.FunctionType, callable],
+    "snv_tx_parse": [types.FunctionType, callable],
     "AVERAGE_BLOCKS_PER_HOUR": [int,long,float]
 }
 
@@ -69,6 +72,19 @@ BLOCKCHAIN_CONFIG_REQUIRED_VALUES = [
     "blockchain_port"
 ]
 
+NUM_CONFIRMATIONS = {
+    "bitcoin": 6,
+    "ethereum": 240
+}
+
+
+def blockchain_confirmations( blockchain_name ):
+    """
+    Determine how many blocks to wait before accepting new records
+    """
+    blockchain_mod = import_blockchain( blockchain_name )
+    return blockchain_mod.AVERAGE_BLOCKS_PER_HOUR
+    
 
 def get_logger(name=None):
     """
@@ -294,6 +310,8 @@ def import_blockchain( blockchain_name ):
         assert hasattr(blockchain_mod, sym), "Missing symbol in %s: %s" % (blockchain_package, sym)
         assert type(getattr(blockchain_mod, sym)) in BLOCKCHAIN_MOD_PROTOTYPE[sym], "Wrong symbol type for %s in %s: %s" % (sym, blockchain_package, type(getattr(blockchain_mod, sym)))
 
+    # tag it with our own information 
+    blockchain_mod.__blockchain_name__ = blockchain_name
     return blockchain_mod
 
 
