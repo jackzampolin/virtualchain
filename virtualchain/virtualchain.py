@@ -32,6 +32,7 @@ import traceback
 import time
 import random
 import errno
+import copy
 
 from ConfigParser import SafeConfigParser
 
@@ -100,52 +101,6 @@ def stop_virtualchain():
     running = False
 
 
-def run_virtualchain( state_engine ):
-    """
-    Continuously and periodically feed new blocks into the state engine.
-    This method loops pretty much forever; consider calling
-    it from a thread or in a subprocess.  You can stop
-    it with stop_virtualchain(), but it only sets a
-    hint to stop indexing (so it may take a few 10s of seconds).
-
-    Return 0 on success (i.e. on exit)
-    Return 1 on failure
-    """
-
-    global running
-
-    config_file = config.get_config_filename()
-    blockchain_opts = config.get_blockchain_config(config_file)
-
-    arg_blockchain_opts, argparser = config.parse_blockchain_args(return_parser=True)
-
-    # command-line overrides config file
-    for (k, v) in arg_blockchain_opts.items():
-        blockchain_opts[k] = v
-
-    log.debug("multiprocessing config = (%s, %s)" % (config.configure_multiprocessing(blockchain_opts)))
-
-    try:
-
-        blockchain_client = connect_blockchain(blockchain_opts)
-
-    except Exception, e:
-        log.exception(e)
-        return 1
-
-    _, last_block_id = indexer.get_index_range(blockchain_client)
-
-    running = True
-    while running:
-
-        # keep refreshing the index
-        sync_virtualchain(blockchain_opts, last_block_id, state_engine )
-
-        time.sleep(config.REINDEX_FREQUENCY)
-
-        _, last_block_id = indexer.get_index_range(blockchain_client)
-
-
 def setup_virtualchain(impl=None, testset=False, blockchain_connection_factory=None, index_worker_env=None):
     """
     Set up the virtual blockchain.
@@ -189,7 +144,7 @@ def virtualchain_set_opfields( op, **fields ):
     return op
 
 
-def connect_blockchain( opts ):
+def connect_blockchain( opts, blockchain=None ):
     """
     Top-level method to connect to the blockchain,
     using either a built-in default, or a module
@@ -197,8 +152,52 @@ def connect_blockchain( opts ):
     to by the environment variable
     VIRTUALCHAIN_MOD_CONNECT_BLOCKCHAIN.
     """
-    connect_blockchain_factory = workpool.multiprocess_connect_blockchain(opts)
-    return connect_blockchain_factory( opts )
+    assert opts is not None
+    blockchain_opts = copy.deepcopy(opts)
+    if blockchain is not None:
+        blockchain_opts['blockchain'] = blockchain
+
+    connect_blockchain_factory = workpool.multiprocess_connect_blockchain(blockchain_opts)
+    return connect_blockchain_factory( blockchain_opts )
+
+
+def snv_serial_number_to_tx_data( blockchain_name, serialno, blockchain_proxy, blockchain_headers_path ):
+    """
+    SNV helper method: convert a serial number (blockheight-txindex) 
+    to a transaction (as a dict).  Use the blockchain-specific proxy to do the query,
+    and use the blockchain-specific headers (stored to blockchain_headers_path)
+    to verify it.
+
+    Return the dict on success
+    Raise on error
+    """
+    blockchain_mod = import_blockchain( blockchain_name )
+    return blockchain_mod.snv_serial_number_to_tx_data( serialno, blockchain_proxy, blockchain_headers_path )
+    
+
+def snv_txid_to_block_data( blockchain_name, txid, blockchain_proxy, blockchain_headers_path ):
+    """
+    SNV helper method: convert a blockchain-specific txid to its blockchain-specific block data.
+    Use the blockchain-specific headers stored to blockchain_headers_path to verify the block's authenticity.
+
+    Return a dict with the block data on success.
+    Raise on error
+    """
+    blockchain_mod = import_blockchain( blockchain_name )
+    return blockchain_mod.snv_txid_to_block_data( txid, blockchain_proxy, blockchain_headers_path )
+
+
+def snv_tx_parse( blockchain_name, txstr ):
+    """
+    SNV helper method:  given a serialized transaction,
+    parse it into its (opcode, payload)
+
+    Return (opcode, payload) on success
+    Raise on error
+    """
+    blockchain_mod = import_blockchain( blockchain_name )
+    return blockchain_mod.snv_tx_parse( txstr )
+
 
 if __name__ == '__main__':
 
